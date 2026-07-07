@@ -129,6 +129,90 @@ class DecayFlash:
     life: int = 42
     max_life: int = 42
 
+class NuclearForceEngine:
+    """
+    현실적인 핵력 계산기
+
+    기존 토이 모델을 대체하지 않고
+    추가적인 핵력을 계산한다.
+    """
+
+    PION_MASS = 138.0
+
+    def __init__(self, simulator):
+        self.sim = simulator
+
+    def yukawa_force(self, r):
+
+        if r <= 0.0:
+            return 0.0
+
+        g = 2.4
+        lam = self.sim.strong_range.get()
+
+        return g * math.exp(-r / lam) / r
+
+
+    def short_range_repulsion(self, r):
+
+        core = self.sim.core_range.get()
+
+        return self.sim.core_strength.get() * math.exp(-(r/core)**2)
+
+
+    def spin_spin_force(self, p1, p2, r):
+
+        if r > self.sim.strong_range.get():
+            return 0.0
+
+        s = 1.0 if p1.spin == p2.spin else -1.0
+
+        return 0.18 * s * math.exp(-r/28)
+
+
+    def tensor_force(self, p1, p2, r, dx, dy):
+
+        if r <= 0:
+            return 0.0
+
+        angle = math.atan2(dy, dx)
+
+        return 0.12 * math.cos(2*angle) * math.exp(-r/36)
+
+
+    def spin_orbit_force(self, p1, p2, r):
+
+        if r <= 0:
+            return 0.0
+
+        relative = (
+            p1.vx-p2.vx,
+            p1.vy-p2.vy
+        )
+
+        l = math.hypot(*relative)
+
+        sign = 1 if p1.spin==p2.spin else -1
+
+        return sign * l * 0.015 * math.exp(-r/45)
+
+
+    def total_force(self, p1, p2, r, dx, dy):
+
+        total = 0.0
+
+        total += self.yukawa_force(r)
+
+        total -= self.short_range_repulsion(r)
+
+        total += self.spin_spin_force(p1,p2,r)
+
+        total += self.tensor_force(p1,p2,r,dx,dy)
+
+        total += self.spin_orbit_force(p1,p2,r)
+
+        return total
+
 
 class NucleonSimulator:
     def __init__(self, root: tk.Tk) -> None:
@@ -190,6 +274,7 @@ class NucleonSimulator:
         self.selection_detail_value = tk.StringVar(value="입자를 클릭하면 세부 정보가 표시돼")
         self.mode_value = tk.StringVar(value="빈 공간 클릭: 입자 추가 | 드래그: 이동")
         self.energy_history: list[tuple[float, float, float]] = []
+        self.nuclear_engine = NuclearForceEngine(self)
 
         self._build_ui()
         self._bind_events()
@@ -1061,7 +1146,20 @@ class NucleonSimulator:
 
                 magnitude = 0.0
                 if self.strong_enabled.get() and self._is_nucleon(a) and self._is_nucleon(b):
-                    magnitude += self._strong_magnitude(r)
+                    magnitude += self._strong_magnitude(
+                        a,
+                        b,
+                        r
+                    )
+
+                magnitude += self.nuclear_engine.total_force(
+                    a,
+                  b,
+                  r,
+                  dx,
+                  dy
+                )
+
                 if self.electric_enabled.get() and a.charge and b.charge:
                     magnitude += self._electric_magnitude(a.charge, b.charge, r)
                     if self._is_electron_nucleus_pair(a, b):
@@ -1087,17 +1185,96 @@ class NucleonSimulator:
     def _is_electron_nucleus_pair(self, a: Particle, b: Particle) -> bool:
         return (a.kind == ELECTRON and b.kind == PROTON) or (a.kind == PROTON and b.kind == ELECTRON)
 
-    def _strong_magnitude(self, r: float) -> float:
-        attract_range = max(4.0, self.strong_range.get())
-        core_range = max(2.0, self.core_range.get())
-        cutoff = attract_range * 3.4
-        if r > cutoff:
+    def _strong_magnitude(self, a: Particle, b: Particle, r: float) -> float:
+
+        if r < 0.001:
             return 0.0
 
-        attraction = self.strong_strength.get() * math.exp(-r / attract_range)
-        core = self.core_strength.get() * math.exp(-r / core_range)
-        taper = (1.0 - r / cutoff) ** 2
-        return (attraction - core) * taper
+        strong_range = self.strong_range.get()
+        core_range = self.core_range.get()
+
+        # ===========================
+        # 1. Yukawa Attraction
+        # ===========================
+
+        pion_lambda = strong_range * 0.65
+
+        yukawa = (
+            self.strong_strength.get()
+            * math.exp(-r / pion_lambda)
+            / r
+        )
+
+        # ===========================
+        # 2. Hard Core Repulsion
+        # ===========================
+
+        hard_core = (
+            self.core_strength.get()
+            * math.exp(-(r / core_range) ** 2)
+        )
+
+        # ===========================
+        # 3. 종류별 핵력
+        # ===========================
+
+        if a.kind == PROTON and b.kind == PROTON:
+            pair = 0.88
+
+        elif a.kind == NEUTRON and b.kind == NEUTRON:
+            pair = 0.95
+
+        else:
+            pair = 1.15
+
+        # ===========================
+        # 4. Spin Coupling
+        # ===========================
+
+        if a.spin == b.spin:
+            spin_factor = 0.93
+        else:
+            spin_factor = 1.12
+
+        # ===========================
+        # 5. Tensor Approximation
+        # ===========================
+
+        rvx = a.vx - b.vx
+        rvy = a.vy - b.vy
+
+        relative_speed = math.hypot(rvx, rvy)
+
+        tensor = (
+            0.04
+            * relative_speed
+            * math.exp(-r / strong_range)
+        )
+
+        # ===========================
+        # 6. Short-distance saturation
+        # ===========================
+
+        saturation = 1.0 / (
+            1.0
+            + math.exp((r - strong_range * 0.45) / 2.5)
+        )
+
+        # ===========================
+        # Final
+        # ===========================
+
+        attraction = (
+            yukawa
+            * pair
+            * spin_factor
+            * saturation
+        )
+
+        repulsion = hard_core
+
+        return attraction - repulsion + tensor
+
 
     def _electric_magnitude(self, charge_a: float, charge_b: float, r: float) -> float:
         return -self.electric_strength.get() * charge_a * charge_b / (r * r + 55.0)
